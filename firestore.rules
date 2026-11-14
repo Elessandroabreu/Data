@@ -1,0 +1,158 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Shared Primitives ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidIsoDate(val) {
+      return val is string && val.size() == 10 && val.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+
+    // --- Entity Validation Blueprints ---
+    function isValidUserSettings(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.seededDefaults is bool &&
+             data.notificationsEnabled is bool &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidMarket(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+             data.active is bool &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidProduct(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.name is string && data.name.size() <= 120 &&
+             isValidId(data.marketId) &&
+             data.marketName is string && data.marketName.size() >= 1 && data.marketName.size() <= 80 &&
+             isValidIsoDate(data.expiryDate) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 500)) &&
+             (!('photoBase64' in data) || (data.photoBase64 is string && data.photoBase64.size() <= 250000)) &&
+             (data.name.size() >= 1 || ('photoBase64' in data && data.photoBase64 is string && data.photoBase64.size() > 0)) &&
+             data.status in ['active', 'resolved', 'archived_auto', 'archived_manual'] &&
+             (!('archiveReason' in data) || data.archiveReason in ['auto', 'manual', 'resolved']) &&
+             (!('archivedDate' in data) || isValidIsoDate(data.archivedDate)) &&
+             (
+               (data.status == 'active' && !('archiveReason' in data) && !('archivedDate' in data)) ||
+               (data.status != 'active' && ('archiveReason' in data) && ('archivedDate' in data))
+             ) &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    // --- User Settings Document ---
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false;
+
+      allow create: if isOwner(userId) &&
+                       isValidId(userId) &&
+                       incoming().keys().hasAll(['userId', 'seededDefaults', 'notificationsEnabled', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'seededDefaults', 'notificationsEnabled', 'createdAt', 'updatedAt']) &&
+                       isValidUserSettings(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidUserSettings(incoming(), userId) &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['seededDefaults', 'notificationsEnabled', 'updatedAt']);
+
+      allow delete: if false;
+
+      // --- Markets Subcollection ---
+      match /markets/{marketId} {
+        allow get: if isOwner(userId) && isValidId(marketId);
+        allow list: if isOwner(userId);
+
+        allow create: if isOwner(userId) &&
+                         isValidId(marketId) &&
+                         incoming().keys().hasAll(['userId', 'name', 'active', 'createdAt', 'updatedAt']) &&
+                         incoming().keys().hasOnly(['userId', 'name', 'active', 'createdAt', 'updatedAt']) &&
+                         isValidMarket(incoming(), userId);
+
+        allow update: if isOwner(userId) &&
+                         isValidId(marketId) &&
+                         incoming().userId == existing().userId &&
+                         incoming().createdAt == existing().createdAt &&
+                         isValidMarket(incoming(), userId) &&
+                         (
+                           incoming().diff(existing()).affectedKeys().hasOnly(['name', 'updatedAt']) ||
+                           incoming().diff(existing()).affectedKeys().hasOnly(['active', 'updatedAt']) ||
+                           incoming().diff(existing()).affectedKeys().hasOnly(['name', 'active', 'updatedAt'])
+                         );
+
+        allow delete: if isOwner(userId) && isValidId(marketId);
+      }
+
+      // --- Products Subcollection ---
+      match /products/{productId} {
+        allow get: if isOwner(userId) && isValidId(productId);
+        allow list: if isOwner(userId);
+
+        allow create: if isOwner(userId) &&
+                         isValidId(productId) &&
+                         incoming().keys().hasAll(['userId', 'name', 'marketId', 'marketName', 'expiryDate', 'status', 'createdAt', 'updatedAt']) &&
+                         incoming().keys().hasOnly(['userId', 'name', 'marketId', 'marketName', 'expiryDate', 'notes', 'photoBase64', 'status', 'archiveReason', 'archivedDate', 'createdAt', 'updatedAt']) &&
+                         isValidProduct(incoming(), userId) &&
+                         exists(/databases/$(database)/documents/users/$(userId)/markets/$(incoming().marketId));
+
+        allow update: if isOwner(userId) &&
+                         isValidId(productId) &&
+                         incoming().userId == existing().userId &&
+                         incoming().createdAt == existing().createdAt &&
+                         isValidProduct(incoming(), userId) &&
+                         (
+                           // Action 1: Edit product details (name, market, expiryDate, notes, photo)
+                           (
+                             incoming().status == existing().status &&
+                             incoming().diff(existing()).affectedKeys().hasOnly(['name', 'marketId', 'marketName', 'expiryDate', 'notes', 'photoBase64', 'updatedAt'])
+                           ) ||
+                           // Action 2: Archive or resolve product
+                           (
+                             existing().status == 'active' &&
+                             incoming().status in ['resolved', 'archived_auto', 'archived_manual'] &&
+                             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'archiveReason', 'archivedDate', 'updatedAt'])
+                           ) ||
+                           // Action 3: Restore product from history back to active list
+                           (
+                             existing().status in ['resolved', 'archived_auto', 'archived_manual'] &&
+                             incoming().status == 'active' &&
+                             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'archiveReason', 'archivedDate', 'updatedAt'])
+                           )
+                         );
+
+        allow delete: if isOwner(userId) && isValidId(productId);
+      }
+    }
+  }
+}

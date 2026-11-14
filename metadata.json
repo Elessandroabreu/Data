@@ -1,0 +1,6 @@
+{
+  "name": "DATA",
+  "description": "Controle de validade de produtos alimentícios nos supermercados para promotor de vendas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

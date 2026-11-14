@@ -1,0 +1,138 @@
+{
+  "entities": {
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "Configurações e controle de inicialização da conta do promotor de vendas.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "ID do usuário autenticado."
+        },
+        "seededDefaults": {
+          "type": "boolean",
+          "description": "Indica se os mercados iniciais já foram cadastrados."
+        },
+        "notificationsEnabled": {
+          "type": "boolean",
+          "description": "Indica se os lembretes de vencimento estão ativados."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Data de criação (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Data de atualização (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": ["userId", "seededDefaults", "notificationsEnabled", "createdAt", "updatedAt"]
+    },
+    "Market": {
+      "title": "Market",
+      "description": "Supermercado onde o promotor de vendas atua.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "ID do usuário proprietário."
+        },
+        "name": {
+          "type": "string",
+          "description": "Nome do supermercado."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Indica se o mercado está ativo para novos cadastros."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Data de criação (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Data de atualização (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": ["userId", "name", "active", "createdAt", "updatedAt"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Produto alimentício monitorado quanto à data de validade.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "ID do usuário proprietário."
+        },
+        "name": {
+          "type": "string",
+          "description": "Nome do produto (obrigatório quando não há foto)."
+        },
+        "marketId": {
+          "type": "string",
+          "description": "ID do mercado associado."
+        },
+        "marketName": {
+          "type": "string",
+          "description": "Nome do mercado no momento do cadastro/edição."
+        },
+        "expiryDate": {
+          "type": "string",
+          "description": "Data de vencimento no formato YYYY-MM-DD."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Observações opcionais do promotor."
+        },
+        "photoBase64": {
+          "type": "string",
+          "description": "Foto compactada do produto em Base64 JPEG (opcional)."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "resolved", "archived_auto", "archived_manual"],
+          "description": "Status do item no fluxo ativo ou no histórico."
+        },
+        "archiveReason": {
+          "type": "string",
+          "enum": ["auto", "manual", "resolved"],
+          "description": "Origem do arquivamento no histórico."
+        },
+        "archivedDate": {
+          "type": "string",
+          "description": "Data em que foi arquivado ou resolvido (YYYY-MM-DD)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Data de criação (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Data de atualização (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": ["userId", "name", "marketId", "marketName", "expiryDate", "status", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserSettings" },
+      "description": "Configurações e estado de inicialização da conta do usuário."
+    },
+    "/users/{userId}/markets/{marketId}": {
+      "schema": { "$ref": "#/entities/Market" },
+      "description": "Supermercados cadastrados pelo promotor."
+    },
+    "/users/{userId}/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Produtos alimentícios monitorados pelo promotor."
+    }
+  }
+}
