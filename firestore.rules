@@ -29,7 +29,9 @@ service cloud.firestore {
     }
 
     function isValidIsoDate(val) {
-      return val is string && val.size() == 10 && val.matches('^\\d{4}-\\d{2}-\\d{2}$');
+      return val is string &&
+             val.size() == 10 &&
+             val.matches('^20\\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$');
     }
 
     // --- Entity Validation Blueprints ---
@@ -91,16 +93,18 @@ service cloud.firestore {
 
       // --- Markets Subcollection ---
       match /markets/{marketId} {
-        allow get: if isOwner(userId) && isValidId(marketId);
-        allow list: if isOwner(userId);
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(marketId);
+        allow list: if isOwner(userId) && isValidId(userId);
 
         allow create: if isOwner(userId) &&
+                         isValidId(userId) &&
                          isValidId(marketId) &&
                          incoming().keys().hasAll(['userId', 'name', 'active', 'createdAt', 'updatedAt']) &&
                          incoming().keys().hasOnly(['userId', 'name', 'active', 'createdAt', 'updatedAt']) &&
                          isValidMarket(incoming(), userId);
 
         allow update: if isOwner(userId) &&
+                         isValidId(userId) &&
                          isValidId(marketId) &&
                          incoming().userId == existing().userId &&
                          incoming().createdAt == existing().createdAt &&
@@ -111,15 +115,16 @@ service cloud.firestore {
                            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'active', 'updatedAt'])
                          );
 
-        allow delete: if isOwner(userId) && isValidId(marketId);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(marketId);
       }
 
       // --- Products Subcollection ---
       match /products/{productId} {
-        allow get: if isOwner(userId) && isValidId(productId);
-        allow list: if isOwner(userId);
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(productId);
+        allow list: if isOwner(userId) && isValidId(userId);
 
         allow create: if isOwner(userId) &&
+                         isValidId(userId) &&
                          isValidId(productId) &&
                          incoming().keys().hasAll(['userId', 'name', 'marketId', 'marketName', 'expiryDate', 'status', 'createdAt', 'updatedAt']) &&
                          incoming().keys().hasOnly(['userId', 'name', 'marketId', 'marketName', 'expiryDate', 'notes', 'photoBase64', 'status', 'archiveReason', 'archivedDate', 'createdAt', 'updatedAt']) &&
@@ -127,14 +132,19 @@ service cloud.firestore {
                          exists(/databases/$(database)/documents/users/$(userId)/markets/$(incoming().marketId));
 
         allow update: if isOwner(userId) &&
+                         isValidId(userId) &&
                          isValidId(productId) &&
                          incoming().userId == existing().userId &&
                          incoming().createdAt == existing().createdAt &&
                          isValidProduct(incoming(), userId) &&
                          (
-                           // Action 1: Edit product details (name, market, expiryDate, notes, photo)
+                           // Action 1: Edit product details (name, market, expiryDate, notes, photo) or sync renamed marketName
                            (
                              incoming().status == existing().status &&
+                             (
+                               incoming().marketId == existing().marketId ||
+                               exists(/databases/$(database)/documents/users/$(userId)/markets/$(incoming().marketId))
+                             ) &&
                              incoming().diff(existing()).affectedKeys().hasOnly(['name', 'marketId', 'marketName', 'expiryDate', 'notes', 'photoBase64', 'updatedAt'])
                            ) ||
                            // Action 2: Archive or resolve product
@@ -151,7 +161,7 @@ service cloud.firestore {
                            )
                          );
 
-        allow delete: if isOwner(userId) && isValidId(productId);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(productId);
       }
     }
   }

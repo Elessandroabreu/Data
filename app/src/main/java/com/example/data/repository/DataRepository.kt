@@ -21,6 +21,8 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
 
 class DataRepository(
@@ -34,6 +36,9 @@ class DataRepository(
         auth = Firebase.auth
     )
 
+    private val seedMutex = Mutex()
+    private val maintenanceMutex = Mutex()
+
     private fun requireUserId(): String {
         return auth.currentUser?.uid
             ?: throw IllegalStateException("Usuário não autenticado. Faça login com o Google.")
@@ -42,6 +47,23 @@ class DataRepository(
     private fun settingsDoc(uid: String) = db.collection("users").document(uid)
     private fun marketsCol(uid: String) = settingsDoc(uid).collection("markets")
     private fun productsCol(uid: String) = settingsDoc(uid).collection("products")
+
+    private fun validateMarketName(raw: String): String {
+        val trimmed = raw.trim()
+        require(trimmed.isNotEmpty()) { "Informe o nome do mercado." }
+        require(trimmed.length <= MAX_MARKET_NAME_LENGTH) {
+            "O nome do mercado deve ter no máximo $MAX_MARKET_NAME_LENGTH caracteres."
+        }
+        return trimmed
+    }
+
+    private fun validateIsoDate(iso: String): String {
+        val trimmed = iso.trim()
+        require(trimmed.length == 10 && DateUtils.isoToUtcMidnightMillis(trimmed) != null) {
+            "Informe uma data de vencimento válida."
+        }
+        return trimmed
+    }
 
     fun observeSettings(userId: String): Flow<UserSettings?> = flow {
         val docRef = settingsDoc(userId)
@@ -119,55 +141,59 @@ class DataRepository(
         )
     }
 
-    suspend fun ensureDefaultMarketsSeeded(): Result<Unit> {
+    suspend fun ensureDefaultMarketsSeeded(): Result<Unit> = seedMutex.withLock {
         return try {
             val uid = requireUserId()
             val userRef = settingsDoc(uid)
-            val snapshot = userRef.get().await()
-            val alreadySeeded = snapshot.exists() && (snapshot.getBoolean("seededDefaults") == true)
-            if (alreadySeeded) {
-                return Result.success(Unit)
-            }
-
             val existingMarkets = marketsCol(uid).limit(1).get().await()
-            val batch = db.batch()
-            if (!snapshot.exists()) {
-                batch.set(
-                    userRef,
-                    mapOf(
-                        "userId" to uid,
-                        "seededDefaults" to true,
-                        "notificationsEnabled" to true,
-                        "createdAt" to FieldValue.serverTimestamp(),
-                        "updatedAt" to FieldValue.serverTimestamp()
-                    )
-                )
-            } else {
-                batch.update(
-                    userRef,
-                    mapOf(
-                        "seededDefaults" to true,
-                        "updatedAt" to FieldValue.serverTimestamp()
-                    )
-                )
-            }
+            val shouldSeedMarkets = existingMarkets.isEmpty
 
-            if (existingMarkets.isEmpty) {
-                DEFAULT_MARKETS.forEach { marketName ->
-                    val mRef = marketsCol(uid).document()
-                    batch.set(
-                        mRef,
+            db.runTransaction { transaction ->
+                val snapshot = transaction.get(userRef)
+                val alreadySeeded = snapshot.exists() && (snapshot.getBoolean("seededDefaults") == true)
+                if (alreadySeeded) {
+                    return@runTransaction
+                }
+
+                if (!snapshot.exists()) {
+                    transaction.set(
+                        userRef,
                         mapOf(
                             "userId" to uid,
-                            "name" to marketName,
-                            "active" to true,
+                            "seededDefaults" to true,
+                            "notificationsEnabled" to true,
                             "createdAt" to FieldValue.serverTimestamp(),
                             "updatedAt" to FieldValue.serverTimestamp()
                         )
                     )
+                } else {
+                    transaction.update(
+                        userRef,
+                        mapOf(
+                            "seededDefaults" to true,
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
                 }
-            }
-            batch.commit().await()
+
+                if (shouldSeedMarkets) {
+                    DEFAULT_MARKETS.forEachIndexed { index, marketName ->
+                        val docId = "default_market_${(index + 1).toString().padStart(2, '0')}"
+                        val mRef = marketsCol(uid).document(docId)
+                        transaction.set(
+                            mRef,
+                            mapOf(
+                                "userId" to uid,
+                                "name" to marketName,
+                                "active" to true,
+                                "createdAt" to FieldValue.serverTimestamp(),
+                                "updatedAt" to FieldValue.serverTimestamp()
+                            )
+                        )
+                    }
+                }
+            }.await()
+
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
@@ -181,25 +207,29 @@ class DataRepository(
         return try {
             val uid = requireUserId()
             val ref = settingsDoc(uid)
-            val snap = ref.get().await()
-            if (snap.exists()) {
-                ref.update(
-                    mapOf(
-                        "notificationsEnabled" to enabled,
-                        "updatedAt" to FieldValue.serverTimestamp()
+            db.runTransaction { transaction ->
+                val snap = transaction.get(ref)
+                if (snap.exists()) {
+                    transaction.update(
+                        ref,
+                        mapOf(
+                            "notificationsEnabled" to enabled,
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
                     )
-                ).await()
-            } else {
-                ref.set(
-                    mapOf(
-                        "userId" to uid,
-                        "seededDefaults" to true,
-                        "notificationsEnabled" to enabled,
-                        "createdAt" to FieldValue.serverTimestamp(),
-                        "updatedAt" to FieldValue.serverTimestamp()
+                } else {
+                    transaction.set(
+                        ref,
+                        mapOf(
+                            "userId" to uid,
+                            "seededDefaults" to false,
+                            "notificationsEnabled" to enabled,
+                            "createdAt" to FieldValue.serverTimestamp(),
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
                     )
-                ).await()
-            }
+                }
+            }.await()
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
@@ -212,8 +242,7 @@ class DataRepository(
     suspend fun addMarket(name: String): Result<String> {
         return try {
             val uid = requireUserId()
-            val trimmed = name.trim()
-            require(trimmed.isNotEmpty()) { "Informe o nome do mercado." }
+            val trimmed = validateMarketName(name)
             val docRef = marketsCol(uid).document()
             docRef.set(
                 mapOf(
@@ -236,16 +265,50 @@ class DataRepository(
     suspend fun updateMarket(marketId: String, newName: String, active: Boolean): Result<Unit> {
         return try {
             val uid = requireUserId()
-            val trimmed = newName.trim()
-            require(trimmed.isNotEmpty()) { "Informe o nome do mercado." }
-            val docRef = marketsCol(uid).document(marketId)
-            docRef.update(
-                mapOf(
-                    "name" to trimmed,
-                    "active" to active,
-                    "updatedAt" to FieldValue.serverTimestamp()
-                )
-            ).await()
+            require(marketId.isNotBlank()) { "Mercado inválido." }
+            val trimmed = validateMarketName(newName)
+            val marketRef = marketsCol(uid).document(marketId)
+            val linkedProducts = productsCol(uid)
+                .whereEqualTo("marketId", marketId)
+                .get()
+                .await()
+                .documents
+                .filter { it.getString("marketName") != trimmed }
+
+            if (linkedProducts.isEmpty()) {
+                marketRef.update(
+                    mapOf(
+                        "name" to trimmed,
+                        "active" to active,
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                ).await()
+            } else {
+                val chunks = linkedProducts.chunked(399)
+                chunks.forEachIndexed { chunkIndex, docs ->
+                    val batch = db.batch()
+                    if (chunkIndex == 0) {
+                        batch.update(
+                            marketRef,
+                            mapOf(
+                                "name" to trimmed,
+                                "active" to active,
+                                "updatedAt" to FieldValue.serverTimestamp()
+                            )
+                        )
+                    }
+                    docs.forEach { prodDoc ->
+                        batch.update(
+                            prodDoc.reference,
+                            mapOf(
+                                "marketName" to trimmed,
+                                "updatedAt" to FieldValue.serverTimestamp()
+                            )
+                        )
+                    }
+                    batch.commit().await()
+                }
+            }
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
@@ -258,6 +321,7 @@ class DataRepository(
     suspend fun setMarketActive(marketId: String, active: Boolean): Result<Unit> {
         return try {
             val uid = requireUserId()
+            require(marketId.isNotBlank()) { "Mercado inválido." }
             val docRef = marketsCol(uid).document(marketId)
             docRef.update(
                 mapOf(
@@ -284,19 +348,34 @@ class DataRepository(
     ): Result<String> {
         return try {
             val uid = requireUserId()
+            require(marketId.isNotBlank()) { "Selecione um mercado." }
+            val cleanMarketName = validateMarketName(marketName)
+            val cleanExpiry = validateIsoDate(expiryDateIso)
             val cleanName = name.trim()
+            val cleanNotes = notes.trim()
             val cleanPhoto = photoBase64?.takeIf { it.isNotBlank() }
+
+            require(cleanName.length <= MAX_PRODUCT_NAME_LENGTH) {
+                "O nome do produto deve ter no máximo $MAX_PRODUCT_NAME_LENGTH caracteres."
+            }
+            require(cleanNotes.length <= MAX_NOTES_LENGTH) {
+                "As observações devem ter no máximo $MAX_NOTES_LENGTH caracteres."
+            }
+            require(cleanPhoto == null || cleanPhoto.length <= MAX_PHOTO_BASE64_LENGTH) {
+                "A imagem ultrapassa o limite permitido."
+            }
             require(cleanName.isNotEmpty() || cleanPhoto != null) {
                 "Informe o nome do produto ou adicione uma foto."
             }
+
             val docRef = productsCol(uid).document()
             val payload = mutableMapOf<String, Any>(
                 "userId" to uid,
                 "name" to cleanName,
                 "marketId" to marketId,
-                "marketName" to marketName.trim(),
-                "expiryDate" to expiryDateIso,
-                "notes" to notes.trim(),
+                "marketName" to cleanMarketName,
+                "expiryDate" to cleanExpiry,
+                "notes" to cleanNotes,
                 "status" to ProductItem.STATUS_ACTIVE,
                 "createdAt" to FieldValue.serverTimestamp(),
                 "updatedAt" to FieldValue.serverTimestamp()
@@ -325,18 +404,34 @@ class DataRepository(
     ): Result<Unit> {
         return try {
             val uid = requireUserId()
+            require(productId.isNotBlank()) { "Produto inválido." }
+            require(marketId.isNotBlank()) { "Selecione um mercado." }
+            val cleanMarketName = validateMarketName(marketName)
+            val cleanExpiry = validateIsoDate(expiryDateIso)
             val cleanName = name.trim()
+            val cleanNotes = notes.trim()
             val cleanPhoto = photoBase64?.takeIf { it.isNotBlank() }
+
+            require(cleanName.length <= MAX_PRODUCT_NAME_LENGTH) {
+                "O nome do produto deve ter no máximo $MAX_PRODUCT_NAME_LENGTH caracteres."
+            }
+            require(cleanNotes.length <= MAX_NOTES_LENGTH) {
+                "As observações devem ter no máximo $MAX_NOTES_LENGTH caracteres."
+            }
+            require(cleanPhoto == null || cleanPhoto.length <= MAX_PHOTO_BASE64_LENGTH) {
+                "A imagem ultrapassa o limite permitido."
+            }
             require(cleanName.isNotEmpty() || cleanPhoto != null) {
                 "Informe o nome do produto ou adicione uma foto."
             }
+
             val docRef = productsCol(uid).document(productId)
             val updates = mutableMapOf<String, Any>(
                 "name" to cleanName,
                 "marketId" to marketId,
-                "marketName" to marketName.trim(),
-                "expiryDate" to expiryDateIso,
-                "notes" to notes.trim(),
+                "marketName" to cleanMarketName,
+                "expiryDate" to cleanExpiry,
+                "notes" to cleanNotes,
                 "updatedAt" to FieldValue.serverTimestamp()
             )
             if (cleanPhoto != null) {
@@ -362,12 +457,17 @@ class DataRepository(
     ): Result<Unit> {
         return try {
             val uid = requireUserId()
+            require(productId.isNotBlank()) { "Produto inválido." }
+            require(targetStatus in VALID_ARCHIVE_STATUSES) { "Status de arquivamento inválido." }
+            require(reason in VALID_ARCHIVE_REASONS) { "Motivo de arquivamento inválido." }
+            val cleanDate = validateIsoDate(archivedDateIso)
+
             val docRef = productsCol(uid).document(productId)
             docRef.update(
                 mapOf(
                     "status" to targetStatus,
                     "archiveReason" to reason,
-                    "archivedDate" to archivedDateIso,
+                    "archivedDate" to cleanDate,
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
             ).await()
@@ -382,13 +482,19 @@ class DataRepository(
 
     suspend fun autoArchiveExpiredProducts(
         products: List<ProductItem>,
-        todayIso: String = DateUtils.todayIso()
-    ): Result<Int> {
+        todayIso: String = DateUtils.todayIso(),
+        excludeIds: Set<String> = emptySet()
+    ): Result<Int> = maintenanceMutex.withLock {
         return try {
             val uid = requireUserId()
+            val cleanToday = validateIsoDate(todayIso)
             val toArchive = products.filter {
-                val diff = DateUtils.daysUntilExpiry(it.expiryDate, todayIso)
-                it.status == ProductItem.STATUS_ACTIVE && diff in -15L..-4L
+                if (it.id in excludeIds || it.status != ProductItem.STATUS_ACTIVE) {
+                    false
+                } else {
+                    val diff = DateUtils.daysUntilExpiry(it.expiryDate, cleanToday)
+                    diff in -15L..-4L
+                }
             }
             if (toArchive.isEmpty()) return Result.success(0)
 
@@ -401,7 +507,7 @@ class DataRepository(
                         mapOf(
                             "status" to ProductItem.STATUS_ARCHIVED_AUTO,
                             "archiveReason" to ProductItem.REASON_AUTO,
-                            "archivedDate" to todayIso,
+                            "archivedDate" to cleanToday,
                             "updatedAt" to FieldValue.serverTimestamp()
                         )
                     )
@@ -420,11 +526,12 @@ class DataRepository(
     suspend fun purgeExpiredOver15Days(
         products: List<ProductItem>,
         todayIso: String = DateUtils.todayIso()
-    ): Result<Int> {
+    ): Result<Int> = maintenanceMutex.withLock {
         return try {
             val uid = requireUserId()
+            val cleanToday = validateIsoDate(todayIso)
             val toDelete = products.filter {
-                DateUtils.daysUntilExpiry(it.expiryDate, todayIso) < -15L
+                DateUtils.daysUntilExpiry(it.expiryDate, cleanToday) < -15L
             }
             if (toDelete.isEmpty()) return Result.success(0)
 
@@ -448,6 +555,7 @@ class DataRepository(
     suspend fun restoreProduct(productId: String): Result<Unit> {
         return try {
             val uid = requireUserId()
+            require(productId.isNotBlank()) { "Produto inválido." }
             val docRef = productsCol(uid).document(productId)
             docRef.update(
                 mapOf(
@@ -469,6 +577,7 @@ class DataRepository(
     suspend fun deleteProductPermanently(productId: String): Result<Unit> {
         return try {
             val uid = requireUserId()
+            require(productId.isNotBlank()) { "Produto inválido." }
             val docRef = productsCol(uid).document(productId)
             docRef.delete().await()
             Result.success(Unit)
@@ -478,5 +587,22 @@ class DataRepository(
             handleFirestoreError(e, OperationType.DELETE, "users/${auth.currentUser?.uid}/products/$productId", auth)
             Result.failure(e)
         }
+    }
+
+    private companion object {
+        const val MAX_MARKET_NAME_LENGTH = 80
+        const val MAX_PRODUCT_NAME_LENGTH = 120
+        const val MAX_NOTES_LENGTH = 500
+        const val MAX_PHOTO_BASE64_LENGTH = 250_000
+        val VALID_ARCHIVE_STATUSES = setOf(
+            ProductItem.STATUS_RESOLVED,
+            ProductItem.STATUS_ARCHIVED_AUTO,
+            ProductItem.STATUS_ARCHIVED_MANUAL
+        )
+        val VALID_ARCHIVE_REASONS = setOf(
+            ProductItem.REASON_AUTO,
+            ProductItem.REASON_MANUAL,
+            ProductItem.REASON_RESOLVED
+        )
     }
 }

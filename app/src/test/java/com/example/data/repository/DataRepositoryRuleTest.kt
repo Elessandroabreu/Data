@@ -92,6 +92,43 @@ class DataRepositoryRuleTest : FirestoreEmulatorTestBase() {
     }
 
     @Test
+    fun updateMarket_renamesLinkedProductsAndSeedIsIdempotent() = runBlocking {
+        val uid = signInTestUser(ALICE_EMAIL)
+        val repo = DataRepository(firestore, auth)
+
+        withTimeout(TIMEOUT_MS) { repo.ensureDefaultMarketsSeeded() }.getOrThrow()
+        withTimeout(TIMEOUT_MS) { repo.ensureDefaultMarketsSeeded() }.getOrThrow()
+
+        val markets = withTimeout(TIMEOUT_MS) {
+            repo.observeMarkets(uid).first { it.size >= 10 }
+        }
+        assertEquals(10, markets.size)
+
+        val targetMarket = markets.first()
+        val productId = withTimeout(TIMEOUT_MS) {
+            repo.addProduct(
+                name = "Leite Integral",
+                marketId = targetMarket.id,
+                marketName = targetMarket.name,
+                expiryDateIso = "2026-11-20",
+                notes = "",
+                photoBase64 = null
+            ).getOrThrow()
+        }
+
+        withTimeout(TIMEOUT_MS) {
+            repo.updateMarket(targetMarket.id, "Mercado Renomeado", true).getOrThrow()
+        }
+
+        val updatedProducts = withTimeout(TIMEOUT_MS) {
+            repo.observeProducts(uid).first { list ->
+                list.any { it.id == productId && it.marketName == "Mercado Renomeado" }
+            }
+        }
+        assertEquals("Mercado Renomeado", updatedProducts.first { it.id == productId }.marketName)
+    }
+
+    @Test
     fun observeProducts_crossUserAccess_failsWithPermissionDenied() = runBlocking {
         val aliceUid = signInTestUser(ALICE_EMAIL)
         signInTestUser(BOB_EMAIL)

@@ -194,7 +194,8 @@ fun ActiveProductCard(
 
     val expiryColors = LocalExpiryPalette.current
     val (tintBg, accentColor, textColor) = when (urgency) {
-        ExpiryUrgency.EXPIRED_RECENT -> Triple(
+        ExpiryUrgency.EXPIRED_RECENT,
+        ExpiryUrgency.SHOULD_AUTO_ARCHIVE -> Triple(
             expiryColors.expiredRecentBg,
             expiryColors.expiredRecentBadge,
             expiryColors.expiredRecentText

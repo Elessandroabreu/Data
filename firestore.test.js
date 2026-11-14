@@ -349,4 +349,21 @@ test("Product archive, resolve, and restore transitions are enforced", async () 
       }
     )
   );
+
+  // Fails when updating product to a nonexistent marketId
+  await assertFails(
+    prodRef.update({
+      marketId: "nonexistent_market",
+      marketName: "Fantasma",
+      updatedAt: pastTimestamp(),
+    })
+  );
+
+  // Fails when using an invalid calendar month/day
+  await assertFails(
+    prodRef.update({
+      expiryDate: "2026-13-45",
+      updatedAt: pastTimestamp(),
+    })
+  );
 });

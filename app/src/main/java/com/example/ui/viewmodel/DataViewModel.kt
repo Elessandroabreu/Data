@@ -102,6 +102,8 @@ class DataViewModel(
     private val _isSaving = MutableStateFlow(false)
     val isSaving: StateFlow<Boolean> = _isSaving.asStateFlow()
 
+    private val _restoredInSessionIds = MutableStateFlow<Set<String>>(emptySet())
+
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages.asSharedFlow()
 
@@ -155,8 +157,9 @@ class DataViewModel(
         marketsState,
         productsState,
         settingsFlow,
-        filterInputsFlow
-    ) { mState, pState, settings, filters ->
+        filterInputsFlow,
+        _restoredInSessionIds
+    ) { mState, pState, settings, filters, restoredIds ->
         val today = filters.today
         val notificationsEnabled = settings?.notificationsEnabled ?: true
 
@@ -188,11 +191,11 @@ class DataViewModel(
         val activeMarkets = markets.filter { it.active }
         val allProducts = (pState as UiState.Success).data
 
-        // Produtos ativos (excluindo os já marcados para arquivamento automático > 3 dias)
+        // Produtos ativos (excluindo pendentes de arquivamento automático > 3 dias, exceto recém-restaurados na sessão)
         val activeProducts = allProducts
             .filter {
                 it.status == ProductItem.STATUS_ACTIVE &&
-                    DateUtils.daysUntilExpiry(it.expiryDate, today) >= -3L
+                    (DateUtils.daysUntilExpiry(it.expiryDate, today) >= -3L || it.id in restoredIds)
             }
             .sortedWith(compareBy<ProductItem> { it.expiryDate }.thenBy { it.name.lowercase() })
 
@@ -213,7 +216,7 @@ class DataViewModel(
 
         byMarket.forEach { product ->
             when (val diff = DateUtils.daysUntilExpiry(product.expiryDate, today)) {
-                in -3L..-1L -> expiredRecent++
+                in -15L..-1L -> expiredRecent++
                 0L -> {
                     dueToday++
                     dueIn3Days++
@@ -239,7 +242,7 @@ class DataViewModel(
 
             val matchesStatus = when (filters.status) {
                 StatusFilter.ALL -> true
-                StatusFilter.EXPIRED_RECENT -> urgency == ExpiryUrgency.EXPIRED_RECENT
+                StatusFilter.EXPIRED_RECENT -> diff in -15L..-1L
                 StatusFilter.DUE_TODAY -> urgency == ExpiryUrgency.DUE_TODAY
                 StatusFilter.DUE_3_DAYS -> diff in 0L..3L
                 StatusFilter.DUE_4_TO_7_DAYS -> diff in 4L..7L
@@ -333,12 +336,15 @@ class DataViewModel(
                     } else {
                         0
                     }
+                    val excludedIds = _restoredInSessionIds.value
                     val hasExpiredOver3Days = products.any {
                         val diff = DateUtils.daysUntilExpiry(it.expiryDate, today)
-                        it.status == ProductItem.STATUS_ACTIVE && diff in -15L..-4L
+                        it.id !in excludedIds &&
+                            it.status == ProductItem.STATUS_ACTIVE &&
+                            diff in -15L..-4L
                     }
                     val archived = if (hasExpiredOver3Days) {
-                        repository.autoArchiveExpiredProducts(products, today).getOrDefault(0)
+                        repository.autoArchiveExpiredProducts(products, today, excludedIds).getOrDefault(0)
                     } else {
                         0
                     }
@@ -423,7 +429,11 @@ class DataViewModel(
             _todayIso.value = today
             val current = (productsState.value as? UiState.Success)?.data ?: return@launch
             val purgeResult = repository.purgeExpiredOver15Days(current, today)
-            val archiveResult = repository.autoArchiveExpiredProducts(current, today)
+            val archiveResult = repository.autoArchiveExpiredProducts(
+                products = current,
+                todayIso = today,
+                excludeIds = _restoredInSessionIds.value
+            )
             if (purgeResult.isFailure || archiveResult.isFailure) {
                 _messages.tryEmit("Não foi possível atualizar. Verifique sua conexão.")
                 return@launch
@@ -477,6 +487,9 @@ class DataViewModel(
             }
             _isSaving.value = false
             result.onSuccess {
+                if (editingProductId != null) {
+                    _restoredInSessionIds.value = _restoredInSessionIds.value - editingProductId
+                }
                 _messages.tryEmit(
                     if (editingProductId == null) "Produto cadastrado com sucesso."
                     else "Produto atualizado."
@@ -497,6 +510,7 @@ class DataViewModel(
                 targetStatus = ProductItem.STATUS_RESOLVED,
                 reason = ProductItem.REASON_RESOLVED
             ).onSuccess {
+                _restoredInSessionIds.value = _restoredInSessionIds.value - productId
                 _messages.tryEmit("Produto marcado como resolvido e movido para o histórico.")
             }.onFailure {
                 _messages.tryEmit("Erro ao resolver produto. Tente novamente.")
@@ -511,6 +525,7 @@ class DataViewModel(
                 targetStatus = ProductItem.STATUS_ARCHIVED_MANUAL,
                 reason = ProductItem.REASON_MANUAL
             ).onSuccess {
+                _restoredInSessionIds.value = _restoredInSessionIds.value - productId
                 _messages.tryEmit("Produto arquivado manualmente no histórico.")
             }.onFailure {
                 _messages.tryEmit("Erro ao arquivar produto. Tente novamente.")
@@ -520,11 +535,13 @@ class DataViewModel(
 
     fun restoreProduct(productId: String) {
         viewModelScope.launch {
+            _restoredInSessionIds.value = _restoredInSessionIds.value + productId
             repository.restoreProduct(productId)
                 .onSuccess {
                     _messages.tryEmit("Produto restaurado para a lista ativa.")
                 }
                 .onFailure {
+                    _restoredInSessionIds.value = _restoredInSessionIds.value - productId
                     _messages.tryEmit("Erro ao restaurar produto.")
                 }
         }
@@ -534,6 +551,7 @@ class DataViewModel(
         viewModelScope.launch {
             repository.deleteProductPermanently(productId)
                 .onSuccess {
+                    _restoredInSessionIds.value = _restoredInSessionIds.value - productId
                     _messages.tryEmit("Registro excluído definitivamente.")
                 }
                 .onFailure {
